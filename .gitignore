@@ -220,3 +220,4 @@ __marimo__/
 
 # Data files
 /data
+*.png
