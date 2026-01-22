@@ -11,3 +11,5 @@ jupyter
 geomloss
 pykeops
 git+https://github.com/scikit-shapes/scikit-shapes.git
+torchviz
+meshio
