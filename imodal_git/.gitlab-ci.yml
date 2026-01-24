@@ -1,0 +1,15 @@
+stages:
+- test
+
+test_ubuntu:
+    stage: test
+
+    script:
+    - cd test
+    - python3 -m unittest discover numpy/
+    - python3 -m unittest discover torch/
+    - python3 -m unittest discover compare/
+
+    tags:
+    - python3
+    - ubuntu18.04 
