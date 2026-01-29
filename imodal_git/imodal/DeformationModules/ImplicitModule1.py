@@ -139,11 +139,13 @@ class ImplicitModule1_Torch(ImplicitModule1Base):
 
         self.__compute_sks()
 
-        tlambdas, _ = torch.solve(S.view(-1, 1), self.__sks)
+        #tlambdas, _ = torch.solve(S.view(-1, 1), self.__sks)
+        tlambdas = torch.linalg.solve(self.__sks, S.view(-1, 1))
         tlambdas = tlambdas/self.coeff
 
         (aq, aqkiaq) = self.__compute_aqkiaq()
-        c, _ = torch.solve(torch.mm(aq.t(), tlambdas), aqkiaq)
+        #c, _ = torch.solve(torch.mm(aq.t(), tlambdas), aqkiaq)
+        c = torch.linalg.solve(aqkiaq, torch.mm(aq.t(), tlambdas))
         self.controls = c.reshape(-1)
         self.__compute_moments()
 
@@ -161,7 +163,8 @@ class ImplicitModule1_Torch(ImplicitModule1Base):
 
     def __compute_moments(self):
         self.__aqh = self.__compute_aqh(self.controls)
-        lambdas, _ = torch.solve(self.__aqh.view(-1, 1), self.__sks)
+        #lambdas, _ = torch.solve(self.__aqh.view(-1, 1), self.__sks)
+        lambdas = torch.linalg.solve(self.__sks, self.__aqh.view(-1, 1))
         self.__lambdas = lambdas.contiguous()
         self.moments = torch.tensordot(self.__lambdas.view(-1, self.sym_dim), torch.transpose(eta(self.manifold.dim, device=self.device), 0, 2), dims=1)
 
@@ -173,7 +176,8 @@ class ImplicitModule1_Torch(ImplicitModule1Base):
             h[i] = 1.
             aqi = self.__compute_aqh(h).flatten()
             aq[:, i] = aqi
-            l, _ = torch.solve(aqi.view(-1, 1), self.__sks)
+            #l, _ = torch.solve(aqi.view(-1, 1), self.__sks)
+            l = torch.linalg.solve(self.__sks, aqi.view(-1, 1))
             lambdas[i, :] = l.flatten()
 
         return (aq, torch.mm(lambdas, aq))
@@ -236,7 +240,8 @@ class ImplicitModule1_KeOps(ImplicitModule1Base):
 
         (aq, aqkiaq) = self.__compute_aqkiaq()
 
-        c, _ = torch.solve(torch.mm(aq.t(), tlambdas.view(-1, 1)), aqkiaq)
+        #c, _ = torch.solve(torch.mm(aq.t(), tlambdas.view(-1, 1)), aqkiaq)
+        c = torch.linalg.solve(aqkiaq, torch.mm(aq.t(), tlambdas.view(-1, 1)))
 
         self.controls = c.flatten()
         self.__compute_moments()
