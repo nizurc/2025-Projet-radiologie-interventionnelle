@@ -1,6 +1,11 @@
+import sys
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 import pyvista as pv
+import torch
+sys.path.insert(0, os.path.abspath('imodal_git'))
+import imodal
 
 # FONCTION DE RÉTRACTION
 def apply_retraction(points, center, strength, radius_influence):
@@ -228,3 +233,159 @@ def visualiser_intervention(
 
     plt.tight_layout()
     plt.show()
+
+def registration_imodal(foie_pre, foie_post, vaisseaux_pre, vaisseaux_post, zone_ablation_post, params=None):
+    """
+    Exécute un recalage biomécanique 2D ou 3D avec imodal, basé sur la modélisation de la croissance 
+    d'une zone d'ablation, tout en contraignant la déformation avec un réseau vasculaire.
+
+    Paramètres :
+    ------------
+    foie_pre : ndarray (N, 2)
+        Contour du foie cible (Pré-Opératoire / Vérité terrain).
+    foie_post : ndarray (M, 2)
+        Contour du foie source (Post-Opératoire / Ce qui va être déformé).
+    vaisseaux_pre : list de ndarray (K, 2)
+        Liste des segments vasculaires cibles (Pré-Opératoire).
+    vaisseaux_post : list de ndarray (L, 2)
+        Liste des segments vasculaires sources (Post-Opératoire).
+    zone_ablation_post : ndarray (P, 2)
+        Contour de la zone d'ablation qui agit comme le moteur de la déformation.
+    params : dict, optionnel
+        Dictionnaire des hyperparamètres physiques. Clés acceptées :
+        - 'sigma_local', 'sigma_global' : Échelles géométriques des forces (défaut: 0.5, 2.0).
+        - 'nu_local', 'nu_global' : Pénalités de régularisation (défaut: 0.01, 1.0).
+        - 'lamb' : Poids de l'attachement géométrique (défaut: 1.0).
+
+    Retours :
+    ---------
+    final_deformed_source_foie : ndarray (M, 2)
+        Coordonnées du foie recalé.
+    final_deformed_vaisseaux : list de ndarray (L, 2)
+        Liste des coordonnées des vaisseaux recalés.
+    final_deformed_za : ndarray (P, 2)
+        Coordonnées de la zone d'ablation dilatée.
+    final_local_force : float
+        Intensité optimale trouvée pour le module local.
+    final_global_force : float
+        Intensité optimale trouvée pour le module global.
+    loss_history : list de float
+        Historique de la fonction de coût à chaque itération L-BFGS.
+    """
+    
+    if params is None:
+        params = {}
+
+    sigma_local = params.get('sigma_local', 0.5)
+    nu_local = params.get('nu_local', 0.01)
+    sigma_global = params.get('sigma_global', 2.0)
+    nu_global = params.get('nu_global', 1.0)
+    lamb = params.get('lamb', 1.0)
+
+    # POINTS SOURCE (POST-OP) - CE QUI BOUGE
+    source_foie = torch.tensor(foie_post, dtype=torch.get_default_dtype(), requires_grad=True)
+    source_vaisseaux = [torch.tensor(v, dtype=torch.get_default_dtype(), requires_grad=True) for v in vaisseaux_post]
+
+    # POINTS CIBLE (PRE-OP) - CE QU'ON VEUT ATTEINDRE
+    target_foie = torch.tensor(foie_pre, dtype=torch.get_default_dtype())
+    target_vaisseaux = [torch.tensor(v, dtype=torch.get_default_dtype()) for v in vaisseaux_pre]
+
+    # MOTEUR (ZONE D'ABLATION POST-OP)
+    moteur_za = torch.tensor(zone_ablation_post, dtype=torch.get_default_dtype())
+
+    # MODELE DE CROISSANCE IMODAL
+    N = moteur_za.shape[0]
+    d = foie_post.shape[1]
+    p = 1
+    C = torch.zeros(N, d, p)
+    C[:, :, 0] = 1.0 # Croissance isotrope
+    # Gestion des rotations selon la dimension
+    if d == 2:
+        rot_init = torch.stack([imodal.Utilities.rot2d(0.)] * N)
+    elif d == 3:
+        rot_init = torch.stack([torch.eye(3, dtype=torch.get_default_dtype())] * N)
+    else:
+        raise ValueError("La dimension des données doit être 2D ou 3D.")
+    gd_init = (moteur_za, rot_init)
+    mod_local = imodal.DeformationModules.ImplicitModule1(d, N, sigma=sigma_local, C=C, nu=nu_local, gd=gd_init) # Module Local
+    mod_global = imodal.DeformationModules.ImplicitModule1(d, N, sigma=sigma_global, C=C, nu=nu_global, gd=gd_init) # Module Global
+
+    # ON DEFINIT LES PARAMETRES DU RECALAGE
+    opt_control_local = torch.zeros(1, requires_grad=True) 
+    opt_control_global = torch.zeros(1, requires_grad=True)
+    optimizer = torch.optim.LBFGS([opt_control_local, opt_control_global], lr=1.0, max_iter=20, history_size=10, line_search_fn='strong_wolfe')
+    attachment_foie = imodal.Attachment.VarifoldAttachment(d, [0.5, 2.0])
+    attachment_vaisseau = imodal.Attachment.VarifoldAttachment(d, [0.5])
+
+    # RECALAGE
+    loss_history = []
+    def closure():
+        optimizer.zero_grad()
+
+        # 1. Mise à jour des contrôles
+        mod_local.fill_controls(opt_control_local)
+        mod_global.fill_controls(opt_control_global)
+        
+        # 2. Calcul de la vitesse
+        vitesse_foie = mod_local(source_foie) + mod_global(source_foie)
+        
+        # 3. Déformation
+        deformed_source_foie = source_foie + vitesse_foie
+        
+        # 4. Calcul de l'erreur (Loss)
+        input_deformed_foie = deformed_source_foie.unsqueeze(0)
+        input_target_foie = target_foie.unsqueeze(0)
+        
+        loss_foie = attachment_foie(input_deformed_foie, input_target_foie)
+
+        loss_vaisseaux = 0.0
+        for v_source, v_target in zip(source_vaisseaux, target_vaisseaux):
+            # 1. Calcul de la vitesse pour CE vaisseau spécifique
+            vitesse_v = mod_local(v_source) + mod_global(v_source)
+            # 2. Déformation
+            deformed_v = v_source + vitesse_v
+            # 3. Ajout de son erreur à l'erreur totale des vaisseaux
+            loss_vaisseaux += attachment_vaisseau(deformed_v.unsqueeze(0), v_target.unsqueeze(0))
+        
+        # Régularisation
+        loss_reg = mod_local.cost() + mod_global.cost()
+        
+        loss = loss_foie + loss_vaisseaux + lamb * loss_reg
+        
+        loss.backward()
+        loss_history.append(loss.item())
+        return loss
+
+    optimizer.step(closure) # lancement de l'optimisation
+
+    # RÉSULTATS
+    final_local_force = opt_control_local.item()
+    final_global_force = opt_control_global.item()
+    with torch.no_grad():
+        # 1. On s'assure que les modules ont les bons contrôles
+        mod_local.fill_controls(opt_control_local)
+        mod_global.fill_controls(opt_control_global)
+        
+        # 2. Calcul de la déformation pour le FOIE entier (Source)
+        vitesse_foie = mod_local(source_foie) + mod_global(source_foie)
+        final_deformed_source_foie = source_foie + vitesse_foie
+        
+        # 3. Calcul de la déformation pour l'ABLATION (Moteur)
+        vitesse_za = mod_local(moteur_za) + mod_global(moteur_za)
+        final_deformed_za = moteur_za + vitesse_za
+        
+        # 4. Calcul de la déformation pour les VAISSEAUX
+        final_deformed_vaisseaux = []
+        for seg in source_vaisseaux:
+            vitesse_v = mod_local(seg) + mod_global(seg)
+            deformed_v = seg + vitesse_v
+            final_deformed_vaisseaux.append(deformed_v.detach().cpu().numpy())
+
+    return (
+        final_deformed_source_foie.detach().cpu().numpy(),  
+        final_deformed_vaisseaux,                           
+        final_deformed_za.detach().cpu().numpy(),           
+        final_local_force, 
+        final_global_force, 
+        loss_history
+    )
