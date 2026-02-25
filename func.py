@@ -4,6 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import pyvista as pv
 import torch
+from tqdm import tqdm
 sys.path.insert(0, os.path.abspath('imodal_git'))
 import imodal
 
@@ -318,8 +319,12 @@ def registration_imodal(foie_pre, foie_post, vaisseaux_pre, vaisseaux_post, zone
     attachment_vaisseau = imodal.Attachment.VarifoldAttachment(d, [0.5])
 
     # RECALAGE
+    total_calls = optimizer.defaults.get("max_eval", None) or optimizer.defaults.get("max_iter", None)
+    pbar = tqdm(total=total_calls, desc="registration_imodal (LBFGS)")
+    closure_calls = 0
     loss_history = []
     def closure():
+        nonlocal closure_calls
         optimizer.zero_grad()
 
         # 1. Mise à jour des contrôles
@@ -353,6 +358,13 @@ def registration_imodal(foie_pre, foie_post, vaisseaux_pre, vaisseaux_post, zone
         loss = loss_foie + loss_vaisseaux + lamb * loss_reg
         
         loss.backward()
+        closure_calls += 1
+        if pbar.total is None:
+            pbar.update(1)
+        elif pbar.n < pbar.total:
+            pbar.update(1)
+        pbar.set_postfix(loss=f"{loss.item():.4e}", calls=closure_calls)
+
         loss_history.append(loss.item())
         return loss
 
