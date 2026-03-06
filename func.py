@@ -8,6 +8,7 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.abspath('imodal_git'))
 import imodal
 
+
 # FONCTION DE RÉTRACTION
 def apply_retraction(points, center, strength, radius_influence):
     """
@@ -103,6 +104,183 @@ def merge_vessels(list_of_vessel_arrays):
         v_mesh = curve_to_polydata(v_points, is_closed=False)
         combined_mesh += v_mesh # Fusion VTK automatique
     return combined_mesh
+
+def _extract_triangle_faces(polydata):
+    """
+    Extract triangle faces from a triangulated PyVista PolyData.
+
+    Returns
+    -------
+    np.ndarray
+        Triangle connectivity with shape (M, 3), dtype int64.
+    """
+    faces = np.asarray(polydata.faces, dtype=np.int64)
+    if faces.size == 0:
+        return np.empty((0, 3), dtype=np.int64)
+
+    tri_faces = []
+    i = 0
+    while i < faces.size:
+        n = int(faces[i])
+        if n == 3:
+            tri_faces.append(faces[i + 1:i + 4])
+        i += n + 1
+
+    if len(tri_faces) == 0:
+        return np.empty((0, 3), dtype=np.int64)
+
+    return np.ascontiguousarray(np.vstack(tri_faces), dtype=np.int64)
+
+def _geometry_to_points_and_faces(geometry):
+    """
+    Convert geometry to points and optional faces.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray | None]
+        (points, faces). Faces are returned only for mesh inputs.
+
+    """
+    if isinstance(geometry, np.ndarray):
+        points = np.asarray(geometry, dtype=np.float64)
+        if points.ndim != 2 or points.shape[1] not in (2, 3):
+            raise ValueError(f"Invalid point shape: shape={points.shape}, expected (N,2) or (N,3).")
+        return np.ascontiguousarray(points, dtype=np.float64), None
+
+    if isinstance(geometry, pv.UnstructuredGrid):
+        surface = geometry.extract_surface()
+        surface = surface.triangulate()
+        surface = surface.clean()
+        if surface is None:
+            raise ValueError("Failed to convert UnstructuredGrid to a triangulated surface.")
+    elif isinstance(geometry, pv.PolyData):
+        surface = geometry.triangulate()
+        surface = surface.clean()
+        if surface is None:
+            raise ValueError("Failed to clean/triangulate PolyData.")
+    else:
+        raise TypeError(
+            "Unsupported geometry type. Use np.ndarray, "
+            "pyvista.PolyData, or pyvista.UnstructuredGrid."
+        )
+
+    points = np.asarray(surface.points, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] not in (2, 3):
+        raise ValueError(f"Invalid point shape: shape={points.shape}, expected (N,2) or (N,3).")
+
+    faces = _extract_triangle_faces(surface)
+    if faces.shape[0] == 0:
+        result = (np.ascontiguousarray(points, dtype=np.float64), None)
+        return result
+
+    result = (np.ascontiguousarray(points, dtype=np.float64), faces)
+    return result
+
+def _chunked_varifold_scalar_product_3d(
+    centers_x,
+    centers_y,
+    lengths_x,
+    lengths_y,
+    normalized_x,
+    normalized_y,
+    sigma,
+    chunk_size,
+    chunk_size_y=None,
+):
+    """
+    Memory-efficient varifold scalar product in 3D using chunked pairwise blocks.
+    """
+    scalar = torch.zeros((), dtype=centers_x.dtype, device=centers_x.device)
+    n_x = centers_x.shape[0]
+    n_y = centers_y.shape[0]
+    if chunk_size_y is None:
+        y_block = n_y
+    else:
+        y_block = max(1, int(chunk_size_y))
+
+    for i in range(0, n_x, chunk_size):
+        i_end = min(i + chunk_size, n_x)
+        cx = centers_x[i:i_end]
+        ux = normalized_x[i:i_end]
+        lx = lengths_x[i:i_end].view(-1)
+
+        for j in range(0, n_y, y_block):
+            j_end = min(j + y_block, n_y)
+            cy = centers_y[j:j_end]
+            uy = normalized_y[j:j_end]
+            ly = lengths_y[j:j_end].view(-1, 1)
+
+            kernel = imodal.Kernels.K_xy(cx, cy, sigma)
+            dot_sq = torch.mm(ux, uy.t()) ** 2
+            weighted = kernel * dot_sq
+            convolved = torch.mm(weighted, ly).view(-1)
+            scalar = scalar + torch.dot(lx, convolved)
+
+    return scalar
+
+def _chunked_varifold_cost_3d(source, target, sigmas, chunk_size, chunk_size_y=None):
+    """
+    3D varifold cost with chunked scalar products.
+
+    Parameters
+    ----------
+    source : tuple[Tensor, Tensor]
+        (vertices, faces) for source mesh.
+    target : tuple[Tensor, Tensor]
+        (vertices, faces) for target mesh.
+    sigmas : list[float]
+        Multi-scale varifold sigmas.
+    chunk_size : int
+        Chunk size for blockwise kernel computation.
+    """
+    vertices_source, faces_source = source
+    vertices_target, faces_target = target
+
+    centers_source, normals_source, lengths_source = imodal.Utilities.compute_centers_normals_lengths(vertices_source, faces_source)
+    centers_target, normals_target, lengths_target = imodal.Utilities.compute_centers_normals_lengths(vertices_target, faces_target)
+
+    eps = torch.finfo(vertices_source.dtype).eps
+    normalized_source = normals_source / lengths_source.clamp_min(eps)
+    normalized_target = normals_target / lengths_target.clamp_min(eps)
+
+    loss = torch.zeros((), dtype=vertices_source.dtype, device=vertices_source.device)
+    for sigma in sigmas:
+        tt = _chunked_varifold_scalar_product_3d(
+            centers_target,
+            centers_target,
+            lengths_target,
+            lengths_target,
+            normalized_target,
+            normalized_target,
+            sigma,
+            chunk_size,
+            chunk_size_y,
+        )
+        ss = _chunked_varifold_scalar_product_3d(
+            centers_source,
+            centers_source,
+            lengths_source,
+            lengths_source,
+            normalized_source,
+            normalized_source,
+            sigma,
+            chunk_size,
+            chunk_size_y,
+        )
+        st = _chunked_varifold_scalar_product_3d(
+            centers_source,
+            centers_target,
+            lengths_source,
+            lengths_target,
+            normalized_source,
+            normalized_target,
+            sigma,
+            chunk_size,
+            chunk_size_y,
+        )
+        loss = loss + tt + ss - 2.0 * st
+
+    return loss
 
 # VISUALISATEUR AVANT/APRÈS AVEC GRILLE DE DÉFORMATION
 def visualiser_zoom_grid(source, target, morphed, window_size=(1200, 600)):
@@ -235,7 +413,7 @@ def visualiser_intervention(
     plt.tight_layout()
     plt.show()
 
-def registration_imodal(foie_pre, foie_post, vaisseaux_pre, vaisseaux_post, zone_ablation_post, params=None):
+def registration_imodal(foie_pre, foie_post, vaisseaux_pre, vaisseaux_post, zone_ablation_post, params=None, dtype=torch.float32):
     """
     Exécute un recalage biomécanique 2D ou 3D avec imodal, basé sur la modélisation de la croissance 
     d'une zone d'ablation, tout en contraignant la déformation avec un réseau vasculaire.
@@ -257,6 +435,8 @@ def registration_imodal(foie_pre, foie_post, vaisseaux_pre, vaisseaux_post, zone
         - 'sigma_local', 'sigma_global' : Échelles géométriques des forces (défaut: 0.5, 2.0).
         - 'nu_local', 'nu_global' : Pénalités de régularisation (défaut: 0.01, 1.0).
         - 'lamb' : Poids de l'attachement géométrique (défaut: 1.0).
+    dtype : torch.dtype, optionnel
+        Précision des calculs (défaut: torch.float32). Peut être torch.float64 pour plus de précision au prix de la vitesse et de la mémoire.
 
     Retours :
     ---------
@@ -282,45 +462,120 @@ def registration_imodal(foie_pre, foie_post, vaisseaux_pre, vaisseaux_post, zone
     sigma_global = params.get('sigma_global', 2.0)
     nu_global = params.get('nu_global', 1.0)
     lamb = params.get('lamb', 1.0)
+    chunk_size_varifold = int(params.get('chunk_size_varifold', 2048))
+    chunk_size_varifold_y = params.get('chunk_size_varifold_y', None)
+    show_progress = bool(params.get('show_progress', True))
+    lbfgs_lr = float(params.get('lbfgs_lr', 1.0))
+    lbfgs_max_iter = int(params.get('lbfgs_max_iter', 20))
+    lbfgs_history_size = int(params.get('lbfgs_history_size', 10))
+    lbfgs_line_search = params.get('lbfgs_line_search_fn', 'strong_wolfe')
+    lbfgs_max_eval = params.get('lbfgs_max_eval', None)
+    requested_device = params.get('device', 'auto')
+    clear_cuda_cache = bool(params.get('clear_cuda_cache', False))
+
+    if requested_device is None or requested_device == 'auto':
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    else:
+        try:
+            device = torch.device(requested_device)
+        except (TypeError, RuntimeError):
+            print(f"Invalid device '{requested_device}'. Falling back to auto selection.")
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        if device.type == 'cuda' and not torch.cuda.is_available():
+            print("CUDA requested but not available. Falling back to CPU.")
+            device = torch.device('cpu')
+
+    if clear_cuda_cache and device.type == 'cuda':
+        torch.cuda.empty_cache()
+
+    d = foie_post.shape[1]
 
     # POINTS SOURCE (POST-OP) - CE QUI BOUGE
-    source_foie = torch.tensor(foie_post, dtype=torch.get_default_dtype(), requires_grad=True)
-    source_vaisseaux = [torch.tensor(v, dtype=torch.get_default_dtype(), requires_grad=True) for v in vaisseaux_post]
+    source_foie = torch.tensor(foie_post, dtype=dtype, device=device, requires_grad=True)
+    source_vaisseaux = [
+        torch.tensor(v, dtype=dtype, device=device, requires_grad=True)
+        for v in vaisseaux_post
+    ]
 
     # POINTS CIBLE (PRE-OP) - CE QU'ON VEUT ATTEINDRE
-    target_foie = torch.tensor(foie_pre, dtype=torch.get_default_dtype())
-    target_vaisseaux = [torch.tensor(v, dtype=torch.get_default_dtype()) for v in vaisseaux_pre]
+    target_foie = torch.tensor(foie_pre, dtype=dtype, device=device)
+    target_vaisseaux = [torch.tensor(v, dtype=dtype, device=device) for v in vaisseaux_pre]
+
+    source_foie_faces = None
+    target_foie_faces = None
+    source_vaisseaux_faces = None
+    target_vaisseaux_faces = None
+    if d == 3:
+        source_faces_np = params.get('_faces_liver_post', None)
+        target_faces_np = params.get('_faces_liver_pre', None)
+        source_vessel_faces_np = params.get('_faces_vessels_post', None)
+        target_vessel_faces_np = params.get('_faces_vessels_pre', None)
+
+        if source_faces_np is None or target_faces_np is None:
+            raise ValueError(
+                "3D varifold attachment requires mesh faces for liver source/target. "
+                "Use registration_imodal_from_mesh with PyVista meshes."
+            )
+
+        source_foie_faces = torch.tensor(source_faces_np, dtype=torch.long, device=device)
+        target_foie_faces = torch.tensor(target_faces_np, dtype=torch.long, device=device)
+
+        if source_vessel_faces_np is not None and target_vessel_faces_np is not None:
+            if len(source_vessel_faces_np) != len(source_vaisseaux) or len(target_vessel_faces_np) != len(target_vaisseaux):
+                raise ValueError("Inconsistent vessel face lists length with vessel point lists.")
+            source_vaisseaux_faces = [
+                torch.tensor(faces, dtype=torch.long, device=device) if faces is not None else None
+                for faces in source_vessel_faces_np
+            ]
+            target_vaisseaux_faces = [
+                torch.tensor(faces, dtype=torch.long, device=device) if faces is not None else None
+                for faces in target_vessel_faces_np
+            ]
+        else:
+            source_vaisseaux_faces = [None] * len(source_vaisseaux)
+            target_vaisseaux_faces = [None] * len(target_vaisseaux)
 
     # MOTEUR (ZONE D'ABLATION POST-OP)
-    moteur_za = torch.tensor(zone_ablation_post, dtype=torch.get_default_dtype())
+    moteur_za = torch.tensor(zone_ablation_post, dtype=dtype, device=device)
 
     # MODELE DE CROISSANCE IMODAL
     N = moteur_za.shape[0]
-    d = foie_post.shape[1]
     p = 1
-    C = torch.zeros(N, d, p)
+    C = torch.zeros(N, d, p, device=device)
     C[:, :, 0] = 1.0 # Croissance isotrope
     # Gestion des rotations selon la dimension
     if d == 2:
-        rot_init = torch.stack([imodal.Utilities.rot2d(0.)] * N)
+        rot_init = torch.stack([imodal.Utilities.rot2d(0.)] * N).to(dtype=dtype, device=device)
     elif d == 3:
-        rot_init = torch.stack([torch.eye(3, dtype=torch.get_default_dtype())] * N)
+        rot_init = torch.stack([torch.eye(3, dtype=dtype, device=device)] * N)
     else:
         raise ValueError("La dimension des données doit être 2D ou 3D.")
     gd_init = (moteur_za, rot_init)
     mod_local = imodal.DeformationModules.ImplicitModule1(d, N, sigma=sigma_local, C=C, nu=nu_local, gd=gd_init) # Module Local
     mod_global = imodal.DeformationModules.ImplicitModule1(d, N, sigma=sigma_global, C=C, nu=nu_global, gd=gd_init) # Module Global
+    if hasattr(mod_local, 'to'):
+        mod_local = mod_local.to(device)
+    if hasattr(mod_global, 'to'):
+        mod_global = mod_global.to(device)
 
     # ON DEFINIT LES PARAMETRES DU RECALAGE
-    opt_control_local = torch.zeros(1, requires_grad=True) 
-    opt_control_global = torch.zeros(1, requires_grad=True)
-    optimizer = torch.optim.LBFGS([opt_control_local, opt_control_global], lr=1.0, max_iter=20, history_size=10, line_search_fn='strong_wolfe')
+    opt_control_local = torch.zeros(1, device=device, requires_grad=True) 
+    opt_control_global = torch.zeros(1, device=device, requires_grad=True)
+    optimizer_kwargs = {
+        'lr': lbfgs_lr,
+        'max_iter': lbfgs_max_iter,
+        'history_size': lbfgs_history_size,
+        'line_search_fn': lbfgs_line_search,
+    }
+    if lbfgs_max_eval is not None:
+        optimizer_kwargs['max_eval'] = int(lbfgs_max_eval)
+    optimizer = torch.optim.LBFGS([opt_control_local, opt_control_global], **optimizer_kwargs)
     attachment_foie = imodal.Attachment.VarifoldAttachment(d, [0.5, 2.0])
     attachment_vaisseau = imodal.Attachment.VarifoldAttachment(d, [0.5])
 
     # RECALAGE
     total_calls = optimizer.defaults.get("max_eval", None) or optimizer.defaults.get("max_iter", None)
-    pbar = tqdm(total=total_calls, desc="registration_imodal (LBFGS)")
+    pbar = tqdm(total=total_calls, desc="registration_imodal (LBFGS)", disable=not show_progress)
     closure_calls = 0
     loss_history = []
     def closure():
@@ -338,19 +593,49 @@ def registration_imodal(foie_pre, foie_post, vaisseaux_pre, vaisseaux_post, zone
         deformed_source_foie = source_foie + vitesse_foie
         
         # 4. Calcul de l'erreur (Loss)
-        input_deformed_foie = deformed_source_foie.unsqueeze(0)
-        input_target_foie = target_foie.unsqueeze(0)
+        if d == 3:
+            input_deformed_foie = (deformed_source_foie, source_foie_faces)
+            input_target_foie = (target_foie, target_foie_faces)
+        else:
+            input_deformed_foie = deformed_source_foie.unsqueeze(0)
+            input_target_foie = target_foie.unsqueeze(0)
         
-        loss_foie = attachment_foie(input_deformed_foie, input_target_foie)
+        if d == 3:
+            loss_foie = _chunked_varifold_cost_3d(
+                input_deformed_foie,
+                input_target_foie,
+                sigmas=[0.5, 2.0],
+                chunk_size=chunk_size_varifold,
+                chunk_size_y=chunk_size_varifold_y,
+            )
+        else:
+            loss_foie = attachment_foie(input_deformed_foie, input_target_foie)
 
         loss_vaisseaux = 0.0
-        for v_source, v_target in zip(source_vaisseaux, target_vaisseaux):
+        source_vaisseaux_faces_iter = source_vaisseaux_faces if source_vaisseaux_faces is not None else [None] * len(source_vaisseaux)
+        target_vaisseaux_faces_iter = target_vaisseaux_faces if target_vaisseaux_faces is not None else [None] * len(target_vaisseaux)
+
+        for v_source, v_target, f_source, f_target in zip(
+            source_vaisseaux,
+            target_vaisseaux,
+            source_vaisseaux_faces_iter,
+            target_vaisseaux_faces_iter,
+        ):
             # 1. Calcul de la vitesse pour CE vaisseau spécifique
             vitesse_v = mod_local(v_source) + mod_global(v_source)
             # 2. Déformation
             deformed_v = v_source + vitesse_v
             # 3. Ajout de son erreur à l'erreur totale des vaisseaux
-            loss_vaisseaux += attachment_vaisseau(deformed_v.unsqueeze(0), v_target.unsqueeze(0))
+            if d == 3 and f_source is not None and f_target is not None:
+                loss_vaisseaux += _chunked_varifold_cost_3d(
+                    (deformed_v, f_source),
+                    (v_target, f_target),
+                    sigmas=[0.5],
+                    chunk_size=chunk_size_varifold,
+                    chunk_size_y=chunk_size_varifold_y,
+                )
+            else:
+                loss_vaisseaux += attachment_vaisseau(deformed_v.unsqueeze(0), v_target.unsqueeze(0))
         
         # Régularisation
         loss_reg = mod_local.cost() + mod_global.cost()
@@ -359,11 +644,10 @@ def registration_imodal(foie_pre, foie_post, vaisseaux_pre, vaisseaux_post, zone
         
         loss.backward()
         closure_calls += 1
-        if pbar.total is None:
-            pbar.update(1)
-        elif pbar.n < pbar.total:
-            pbar.update(1)
-        pbar.set_postfix(loss=f"{loss.item():.4e}", calls=closure_calls)
+        if show_progress:
+            if pbar.total is None or pbar.n < pbar.total:
+                pbar.update(1)
+            pbar.set_postfix(loss=f"{loss.item():.4e}", calls=closure_calls)
 
         loss_history.append(loss.item())
         return loss
@@ -400,4 +684,93 @@ def registration_imodal(foie_pre, foie_post, vaisseaux_pre, vaisseaux_post, zone
         final_local_force, 
         final_global_force, 
         loss_history
+    )
+
+def registration_imodal_from_mesh(
+    liver_pre,
+    liver_post,
+    vessels_pre,
+    vessels_post,
+    ablation_zone_post,
+    params=None,
+    dtype=torch.float32
+):
+    """
+    Converts PyVista objects (or ndarrays) to NumPy point arrays, then calls
+    `registration_imodal` without changing its internal behavior.
+
+    Parameters
+    ----------
+    liver_pre : PyVista PolyData or UnstructuredGrid or ndarray
+        Geometry of the liver in the pre-operative state (target).
+    liver_post : PyVista PolyData or UnstructuredGrid or ndarray
+        Geometry of the liver in the post-operative state (source).
+    vessels_pre : list of PyVista PolyData or UnstructuredGrid or ndarray
+        List of geometries for the vessels in the pre-operative state (target).
+    vessels_post : list of PyVista PolyData or UnstructuredGrid or ndarray
+        List of geometries for the vessels in the post-operative state (source).
+    ablation_zone_post : PyVista PolyData or UnstructuredGrid or ndarray
+        Geometry of the ablation zone in the post-operative state (moteur de la déformation).
+    params : dict, optional
+        Additional parameters to pass to `registration_imodal`. Keys accepted:
+    dtype : torch.dtype, optional
+        Data type for the computations (default: torch.float32). Can be set to torch.float64 for higher precision at the cost of speed and memory.
+    """
+    if params is None:
+        params = {}
+
+    liver_pre_np, liver_pre_faces = _geometry_to_points_and_faces(
+        liver_pre
+    )
+    liver_post_np, liver_post_faces = _geometry_to_points_and_faces(
+        liver_post
+    )
+    ablation_zone_post_np, _ = _geometry_to_points_and_faces(
+        ablation_zone_post
+    )
+
+    vessels_pre_data = [
+        _geometry_to_points_and_faces(v)
+        for i, v in enumerate(vessels_pre)
+    ]
+    vessels_post_data = [
+        _geometry_to_points_and_faces(v)
+        for i, v in enumerate(vessels_post)
+    ]
+
+    vessels_pre_np = [points for points, _faces in vessels_pre_data]
+    vessels_post_np = [points for points, _faces in vessels_post_data]
+    vessels_pre_faces = [faces for _points, faces in vessels_pre_data]
+    vessels_post_faces = [faces for _points, faces in vessels_post_data]
+
+    dim_pre = liver_pre_np.shape[1]
+    dim_post = liver_post_np.shape[1]
+    dim_ablation = ablation_zone_post_np.shape[1]
+    if not (dim_pre == dim_post == dim_ablation):
+        raise ValueError(
+            f"Inconsistent dimensions: liver_pre={dim_pre}, liver_post={dim_post}, ablation_zone_post={dim_ablation}."
+        )
+
+    for i, vessel in enumerate(vessels_pre_np):
+        if vessel.shape[1] != dim_pre:
+            raise ValueError(f"Dimension of vessels_pre[{i}]={vessel.shape[1]} is inconsistent with liver={dim_pre}.")
+    for i, vessel in enumerate(vessels_post_np):
+        if vessel.shape[1] != dim_pre:
+            raise ValueError(f"Dimension of vessels_post[{i}]={vessel.shape[1]} is inconsistent with liver={dim_pre}.")
+
+    registration_params = dict(params)
+    if dim_pre == 3:
+        registration_params['_faces_liver_pre'] = liver_pre_faces
+        registration_params['_faces_liver_post'] = liver_post_faces
+        registration_params['_faces_vessels_pre'] = vessels_pre_faces
+        registration_params['_faces_vessels_post'] = vessels_post_faces
+
+    return registration_imodal(
+        liver_pre_np,
+        liver_post_np,
+        vessels_pre_np,
+        vessels_post_np,
+        ablation_zone_post_np,
+        params=registration_params,
+        dtype=dtype
     )
