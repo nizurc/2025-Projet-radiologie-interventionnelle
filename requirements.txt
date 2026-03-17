@@ -1,18 +1,19 @@
-numpy
+numpy==1.26.4
 matplotlib
 nibabel
 nilearn
-torch
+torch>=2.1,<2.6
 pyvista
 trame
 napari
 pyqt5
 jupyter
 geomloss
-pykeops
-git+https://github.com/scikit-shapes/scikit-shapes.git
+pykeops>=2.2
+# git+https://github.com/scikit-shapes/scikit-shapes.git
 torchviz
 meshio
 trame
 trame-vtk
 trame-vuetify
+torchdiffeq>=0.2.3

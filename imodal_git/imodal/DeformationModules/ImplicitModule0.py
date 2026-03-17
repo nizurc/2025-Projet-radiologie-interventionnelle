@@ -108,7 +108,7 @@ class ImplicitModule0_Torch(ImplicitModule0Base):
     def compute_geodesic_control(self, man):
         vs = self.adjoint(man)
         K_q = K_xx(self.manifold.gd, self.sigma) + self.nu * torch.eye(self.manifold.nb_pts, device=self.device)
-        controls, _ = torch.solve(vs(self.manifold.gd), K_q)
+        controls = torch.linalg.solve(K_q, vs(self.manifold.gd))
         self.controls = controls/self.coeff
 
 

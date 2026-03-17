@@ -94,7 +94,7 @@ class Translations_Torch(TranslationsBase):
         vs = self.adjoint(man)
         K_q = K_xx(self.manifold.gd, self.sigma)
 
-        controls, _ = torch.solve(vs(self.manifold.gd), K_q)
+        controls = torch.linalg.solve(K_q, vs(self.manifold.gd))
         self.controls = controls.contiguous()
 
 
