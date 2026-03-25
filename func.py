@@ -7,6 +7,7 @@ import torch
 from tqdm import tqdm
 sys.path.insert(0, os.path.abspath('imodal_git'))
 import imodal
+import imodal.Utilities
 
 
 # FONCTION DE RÉTRACTION
@@ -773,4 +774,347 @@ def registration_imodal_from_mesh(
         ablation_zone_post_np,
         params=registration_params,
         dtype=dtype
+    )
+
+def registration_imodal_geodesic_shooting(foie_pre, foie_post, vaisseaux_pre, vaisseaux_post, zone_ablation_post, params=None, dtype=torch.float32):
+    """
+    Recalage biomécanique 2D ou 3D avec imodal utilisant le shooting géodésique.
+
+    On modélise la rétractation autour de la zone d'ablation comme un module de
+    croissance implicite (ImplicitModule1), et on utilise l'infrastructure IMODAL
+    (RegistrationModel + Fitter) pour optimiser les moments initiaux via un
+    schéma de shooting Hamiltonien.
+
+    Paramètres :
+    ------------
+    foie_pre : ndarray (N, d)
+        Points du foie cible (Pré-Opératoire / Vérité terrain).
+    foie_post : ndarray (M, d)
+        Points du foie source (Post-Opératoire / Ce qui va être déformé).
+    vaisseaux_pre : list de ndarray (K_i, d)
+        Liste des repères vasculaires cibles (Pré-Opératoire).
+    vaisseaux_post : list de ndarray (L_i, d)
+        Liste des repères vasculaires sources (Post-Opératoire).
+    zone_ablation_post : ndarray (P, d)
+        Points de la zone d'ablation (moteur de la déformation).
+    params : dict, optionnel
+        Hyperparamètres. Clés acceptées :
+        - 'sigma_local'  : échelle du module de croissance local (défaut: auto).
+        - 'nu_local'     : régularisation du module local (défaut: 0.001).
+        - 'sigma_global' : échelle du module de croissance global (défaut: auto).
+        - 'nu_global'    : régularisation du module global (défaut: 0.001).
+        - 'coeff_local'  : coefficient de coût du module local (défaut: 0.01).
+        - 'coeff_global' : coefficient de coût du module global (défaut: 1.0).
+        - 'lamb'         : poids de l'attachement aux données (défaut: 1.0).
+        - 'varifold_sigmas_liver' : sigmas varifold pour le foie (défaut: auto).
+        - 'vessel_weight': poids de l'attache des vaisseaux (défaut: 100.).
+        - 'shoot_solver' : solveur ODE ('euler', 'rk4', etc., défaut: 'euler').
+        - 'shoot_it'     : nombre de pas d'intégration (défaut: 10).
+        - 'lbfgs_max_iter': itérations LBFGS max (défaut: 100).
+        - 'fit_gd'       : optimiser aussi les positions du module (défaut: False).
+    dtype : torch.dtype
+        Précision des calculs.
+
+    Retours :
+    ---------
+    final_deformed_liver : ndarray (M, d)
+    final_deformed_vessels : list de ndarray
+    final_deformed_ablation : ndarray (P, d)
+    final_local_force : float (norme des moments locaux)
+    final_global_force : float (norme des moments globaux)
+    loss_history : list de float
+    """
+    if params is None:
+        params = {}
+
+    d = foie_post.shape[1]
+
+    # --- Device selection ---
+    requested_device = params.get('device', 'auto')
+    if requested_device is None or requested_device == 'auto':
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    else:
+        try:
+            device = torch.device(requested_device)
+        except (TypeError, RuntimeError):
+            print(f"Invalid device '{requested_device}'. Falling back to auto selection.")
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        if device.type == 'cuda' and not torch.cuda.is_available():
+            print("CUDA requested but not available. Falling back to CPU.")
+            device = torch.device('cpu')
+
+    clear_cuda_cache = bool(params.get('clear_cuda_cache', False))
+    if clear_cuda_cache and device.type == 'cuda':
+        torch.cuda.empty_cache()
+
+    show_progress = bool(params.get('show_progress', True))
+    random_seed = params.get('random_seed', None)
+    if random_seed is not None:
+        torch.manual_seed(int(random_seed))
+
+    # --- Auto-scale sigmas based on data extent ---
+    all_points = np.vstack([foie_post, zone_ablation_post] + list(vaisseaux_post))
+    data_extent = np.ptp(all_points, axis=0)
+    data_diag = float(np.linalg.norm(data_extent))
+
+    sigma_local = params.get('sigma_local', data_diag * 0.08)
+    nu_local = params.get('nu_local', 0.001)
+    coeff_local = params.get('coeff_local', 0.01)
+    sigma_global = params.get('sigma_global', data_diag * 0.25)
+    nu_global = params.get('nu_global', 0.001)
+    coeff_global = params.get('coeff_global', 1.0)
+    lamb = params.get('lamb', 1.0)
+    vessel_weight = params.get('vessel_weight', 100.)
+    shoot_solver = params.get('shoot_solver', 'euler')
+    shoot_it = int(params.get('shoot_it', 10))
+    lbfgs_max_iter = int(params.get('lbfgs_max_iter', 100))
+    fit_gd = params.get('fit_gd', False)
+
+    # Varifold sigmas: auto-scale to ~5% and ~20% of diagonal
+    default_varifold_sigmas = [data_diag * 0.05, data_diag * 0.2]
+    varifold_sigmas_liver = params.get('varifold_sigmas_liver', default_varifold_sigmas)
+
+    print(f"[registration_imodal] dim={d}, device={device}, dtype={dtype}")
+    print(f"  data diagonal={data_diag:.2f}")
+    print(f"  sigma_local={sigma_local:.4f}, nu_local={nu_local:.6f}, coeff_local={coeff_local}")
+    print(f"  sigma_global={sigma_global:.4f}, nu_global={nu_global:.6f}, coeff_global={coeff_global}")
+    print(f"  varifold_sigmas_liver={varifold_sigmas_liver}")
+    print(f"  lamb={lamb}, vessel_weight={vessel_weight}")
+    print(f"  shoot_solver={shoot_solver}, shoot_it={shoot_it}, lbfgs_max_iter={lbfgs_max_iter}")
+
+    # --- Set IMODAL dtype and backend ---
+    prev_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    imodal.Utilities.set_compute_backend('torch')
+
+    try:
+        # --- Build tensors ---
+        source_foie_t = torch.tensor(foie_post, dtype=dtype, device=device)
+        target_foie_t = torch.tensor(foie_pre, dtype=dtype, device=device)
+        source_vaisseaux_t = [torch.tensor(v, dtype=dtype, device=device) for v in vaisseaux_post]
+        target_vaisseaux_t = [torch.tensor(v, dtype=dtype, device=device) for v in vaisseaux_pre]
+        moteur_za_t = torch.tensor(zone_ablation_post, dtype=dtype, device=device)
+
+        # Faces for 3D varifold
+        source_foie_faces_t = None
+        target_foie_faces_t = None
+        if d == 3:
+            source_faces_np = params.get('_faces_liver_post', None)
+            target_faces_np = params.get('_faces_liver_pre', None)
+            if source_faces_np is not None:
+                source_foie_faces_t = torch.tensor(source_faces_np, dtype=torch.long, device=device)
+            if target_faces_np is not None:
+                target_foie_faces_t = torch.tensor(target_faces_np, dtype=torch.long, device=device)
+
+        # --- Source deformables (POST-OP, what gets deformed) ---
+        deformables_source = []
+        deformables_target = []
+        attachments = []
+
+        # Liver
+        if d == 3 and source_foie_faces_t is not None and target_foie_faces_t is not None:
+            deformable_liver_source = imodal.Models.DeformableMesh(source_foie_t, source_foie_faces_t.to(torch.int), label="liver")
+            deformable_liver_target = imodal.Models.DeformableMesh(target_foie_t, target_foie_faces_t.to(torch.int), label="liver_target")
+            attachments.append(imodal.Attachment.VarifoldAttachment(3, varifold_sigmas_liver, backend='torch'))
+        else:
+            deformable_liver_source = imodal.Models.DeformablePoints(source_foie_t, label="liver")
+            deformable_liver_target = imodal.Models.DeformablePoints(target_foie_t, label="liver_target")
+            attachments.append(imodal.Attachment.VarifoldAttachment(d, varifold_sigmas_liver, backend='torch'))
+        deformables_source.append(deformable_liver_source)
+        deformables_target.append(deformable_liver_target)
+
+        # Vessels (landmarks): use pointwise L2 distance with correspondence
+        for i, (v_src, v_tgt) in enumerate(zip(source_vaisseaux_t, target_vaisseaux_t)):
+            deformables_source.append(imodal.Models.DeformablePoints(v_src, label=f"vessel_{i}"))
+            deformables_target.append(imodal.Models.DeformablePoints(v_tgt, label=f"vessel_{i}_target"))
+            attachments.append(imodal.Attachment.EuclideanPointwiseDistanceAttachment(weight=vessel_weight))
+
+        # Ablation zone: transported passively through the flow (no cost)
+        deformable_ablation_source = imodal.Models.DeformablePoints(moteur_za_t.clone(), label="ablation")
+        deformable_ablation_target = imodal.Models.DeformablePoints(moteur_za_t.clone(), label="ablation_target")
+        deformables_source.append(deformable_ablation_source)
+        deformables_target.append(deformable_ablation_target)
+        attachments.append(imodal.Attachment.NullLoss())
+
+        # --- Deformation modules ---
+        N_ablation = moteur_za_t.shape[0]
+        C = torch.zeros(N_ablation, d, 1, dtype=dtype, device=device)
+        C[:, :, 0] = 1.0  # isotropic growth
+
+        if d == 2:
+            rot_init = torch.stack([imodal.Utilities.rot2d(0.)] * N_ablation).to(dtype=dtype, device=device)
+        elif d == 3:
+            rot_init = torch.stack([torch.eye(3, dtype=dtype, device=device)] * N_ablation)
+        else:
+            raise ValueError("Dimension must be 2 or 3.")
+
+        gd_init = (moteur_za_t.clone(), rot_init)
+
+        mod_growth_local = imodal.DeformationModules.ImplicitModule1(
+            d, N_ablation, sigma=sigma_local, C=C, nu=nu_local,
+            coeff=coeff_local, gd=gd_init
+        )
+        mod_growth_global = imodal.DeformationModules.ImplicitModule1(
+            d, N_ablation, sigma=sigma_global, C=C, nu=nu_global,
+            coeff=coeff_global, gd=gd_init
+        )
+
+        # Small-scale corrections on the liver source points
+        coeff_small = params.get('coeff_small', 1.0)
+        sigma_small = params.get('sigma_small', sigma_local * 0.5)
+        nu_small = params.get('nu_small', nu_local)
+        mod_small = imodal.DeformationModules.ImplicitModule0(
+            d, source_foie_t.shape[0], sigma_small, nu=nu_small,
+            coeff=coeff_small, gd=source_foie_t.clone()
+        )
+
+        global_translation = imodal.DeformationModules.GlobalTranslation(d)
+
+        deformation_modules = [global_translation, mod_growth_local, mod_growth_global, mod_small]
+
+        # fit_gd: whether to also optimize module positions
+        fit_gd_list = [False, fit_gd, fit_gd, False]
+
+        # --- Build RegistrationModel ---
+        model = imodal.Models.RegistrationModel(
+            deformables_source,
+            deformation_modules,
+            attachments,
+            fit_gd=fit_gd_list,
+            lam=lamb,
+        )
+        model.to_device(str(device))
+
+        # --- Fit ---
+        costs = {}
+        fitter = imodal.Models.Fitter(model, optimizer='torch_lbfgs')
+
+        fitter.fit(
+            deformables_target,
+            lbfgs_max_iter,
+            costs=costs,
+            options={
+                'shoot_solver': shoot_solver,
+                'shoot_it': shoot_it,
+                'line_search_fn': 'strong_wolfe',
+            },
+        )
+
+        # --- Collect loss history ---
+        loss_history = []
+        if costs:
+            keys = list(costs.keys())
+            n_iters = len(costs[keys[0]])
+            for i in range(n_iters):
+                loss_history.append(sum(costs[k][i] for k in keys))
+
+        # --- Extract deformed results ---
+        intermediates = {}
+        with torch.autograd.no_grad():
+            deformed = model.compute_deformed(shoot_solver, shoot_it, intermediates=intermediates)
+
+        # Liver = first deformable
+        final_deformed_liver = deformed[0][0].detach().cpu().numpy()
+
+        # Vessels = next deformables
+        n_vessels = len(vaisseaux_post)
+        final_deformed_vaisseaux = []
+        for i in range(n_vessels):
+            final_deformed_vaisseaux.append(deformed[1 + i][0].detach().cpu().numpy())
+
+        # Ablation zone = last deformable (transported passively)
+        idx_ablation = 1 + n_vessels
+        final_deformed_za = deformed[idx_ablation][0].detach().cpu().numpy()
+
+        # Norms of momenta as summary statistics
+        n_deformables = len(deformables_source)
+        final_states = intermediates['states'][-1]
+        local_cotan_norm = 0.
+        global_cotan_norm = 0.
+        try:
+            local_cotan_norm = float(final_states[n_deformables + 1].cotan[0].norm().item())
+        except Exception:
+            pass
+        try:
+            global_cotan_norm = float(final_states[n_deformables + 2].cotan[0].norm().item())
+        except Exception:
+            pass
+
+    finally:
+        torch.set_default_dtype(prev_dtype)
+
+    return (
+        final_deformed_liver,
+        final_deformed_vaisseaux,
+        final_deformed_za,
+        local_cotan_norm,
+        global_cotan_norm,
+        loss_history,
+    )
+
+def registration_imodal_geodesic_shooting_from_mesh(
+    liver_pre,
+    liver_post,
+    vessels_pre,
+    vessels_post,
+    ablation_zone_post,
+    params=None,
+    dtype=torch.float32
+):
+    """
+    Converts PyVista objects (or ndarrays) to NumPy arrays, then calls
+    ``registration_imodal`` with proper mesh face information for 3-D
+    varifold attachment.
+
+    Parameters
+    ----------
+    liver_pre : PyVista PolyData or UnstructuredGrid or ndarray
+        Geometry of the liver in the pre-operative state (target).
+    liver_post : PyVista PolyData or UnstructuredGrid or ndarray
+        Geometry of the liver in the post-operative state (source).
+    vessels_pre : list of PyVista PolyData or UnstructuredGrid or ndarray
+        Vessel landmarks in the pre-operative state (target).
+    vessels_post : list of PyVista PolyData or UnstructuredGrid or ndarray
+        Vessel landmarks in the post-operative state (source).
+    ablation_zone_post : PyVista PolyData or UnstructuredGrid or ndarray
+        Ablation zone geometry (moteur de la déformation).
+    params : dict, optional
+        Additional parameters forwarded to ``registration_imodal_geodesic_shooting``.
+    dtype : torch.dtype, optional
+        Data type (default: torch.float32).
+    """
+    if params is None:
+        params = {}
+
+    liver_pre_np, liver_pre_faces = _geometry_to_points_and_faces(liver_pre)
+    liver_post_np, liver_post_faces = _geometry_to_points_and_faces(liver_post)
+    ablation_zone_post_np, _ = _geometry_to_points_and_faces(ablation_zone_post)
+
+    vessels_pre_data = [_geometry_to_points_and_faces(v) for v in vessels_pre]
+    vessels_post_data = [_geometry_to_points_and_faces(v) for v in vessels_post]
+
+    vessels_pre_np = [pts for pts, _ in vessels_pre_data]
+    vessels_post_np = [pts for pts, _ in vessels_post_data]
+
+    dim = liver_pre_np.shape[1]
+    if not (liver_post_np.shape[1] == dim == ablation_zone_post_np.shape[1]):
+        raise ValueError(
+            f"Inconsistent dimensions: liver_pre={dim}, "
+            f"liver_post={liver_post_np.shape[1]}, "
+            f"ablation={ablation_zone_post_np.shape[1]}."
+        )
+
+    registration_params = dict(params)
+    if dim == 3:
+        registration_params['_faces_liver_pre'] = liver_pre_faces
+        registration_params['_faces_liver_post'] = liver_post_faces
+
+    return registration_imodal_geodesic_shooting(
+        liver_pre_np,
+        liver_post_np,
+        vessels_pre_np,
+        vessels_post_np,
+        ablation_zone_post_np,
+        params=registration_params,
+        dtype=dtype,
     )
