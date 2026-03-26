@@ -463,6 +463,8 @@ def registration_imodal(foie_pre, foie_post, vaisseaux_pre, vaisseaux_post, zone
     sigma_global = params.get('sigma_global', 2.0)
     nu_global = params.get('nu_global', 1.0)
     lamb = params.get('lamb', 1.0)
+    sigmas_liver = params.get('sigmas_liver', [0.5, 2.0])
+    sigmas_vessel = params.get('sigmas_vessel', [0.5])
     chunk_size_varifold = int(params.get('chunk_size_varifold', 2048))
     chunk_size_varifold_y = params.get('chunk_size_varifold_y', None)
     show_progress = bool(params.get('show_progress', True))
@@ -571,8 +573,8 @@ def registration_imodal(foie_pre, foie_post, vaisseaux_pre, vaisseaux_post, zone
     if lbfgs_max_eval is not None:
         optimizer_kwargs['max_eval'] = int(lbfgs_max_eval)
     optimizer = torch.optim.LBFGS([opt_control_local, opt_control_global], **optimizer_kwargs)
-    attachment_foie = imodal.Attachment.VarifoldAttachment(d, [0.5, 2.0])
-    attachment_vaisseau = imodal.Attachment.VarifoldAttachment(d, [0.5])
+    attachment_foie = imodal.Attachment.VarifoldAttachment(d, sigmas_liver)
+    attachment_vaisseau = imodal.Attachment.VarifoldAttachment(d, sigmas_vessel)
 
     # RECALAGE
     total_calls = optimizer.defaults.get("max_eval", None) or optimizer.defaults.get("max_iter", None)
@@ -605,7 +607,7 @@ def registration_imodal(foie_pre, foie_post, vaisseaux_pre, vaisseaux_post, zone
             loss_foie = _chunked_varifold_cost_3d(
                 input_deformed_foie,
                 input_target_foie,
-                sigmas=[0.5, 2.0],
+                sigmas=sigmas_liver,
                 chunk_size=chunk_size_varifold,
                 chunk_size_y=chunk_size_varifold_y,
             )
@@ -631,7 +633,7 @@ def registration_imodal(foie_pre, foie_post, vaisseaux_pre, vaisseaux_post, zone
                 loss_vaisseaux += _chunked_varifold_cost_3d(
                     (deformed_v, f_source),
                     (v_target, f_target),
-                    sigmas=[0.5],
+                    sigmas=sigmas_vessel,
                     chunk_size=chunk_size_varifold,
                     chunk_size_y=chunk_size_varifold_y,
                 )
